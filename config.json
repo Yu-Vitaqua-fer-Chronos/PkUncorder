@@ -1,0 +1,7 @@
+{
+    "url_prefix": "",
+    "output_folder": "output",
+    "force_download": false,
+    "output_system_json": "sys.json",
+    "flat_folder": false
+}
