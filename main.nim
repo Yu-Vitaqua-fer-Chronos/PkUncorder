@@ -69,11 +69,8 @@ let config: Config = parseFile("config.json").to(Config)
 
 var
   validAvatarUUIDsLock = RLock()
-  httpCounterLock = RLock()
   avatarIndexLock = RLock()
   usedUrlsLock = RLock()
-
-  httpClients = newSeq[HttpClient](0)
 
   avatarCache {.guard: avatarIndexLock.} = newSeq[string](0)
   avatarIndex {.guard: avatarIndexLock.} : AvatarIndex
@@ -83,22 +80,16 @@ var
   sysjson = parseJson(readFile("system.json"))
   system = sysjson.to(PkSystem)
 
-  httpCounter {.guard: httpCounterLock.} = 0
-
 try:
   avatarIndex = parseFile(config.output_folder / "index.json").to(AvatarIndex)
 except IOError:
   avatarIndex = AvatarIndex(isFlat: config.flat_folder)
 
 initRLock(validAvatarUUIDsLock)
-initRLock(httpCounterLock)
 initRLock(avatarIndexLock)
 initRLock(usedUrlsLock)
 
-for i in 0..7:
-  httpClients.add newHttpClient()
-
-let httpClientsLen = httpClients.len
+setMaxPoolSize(8)
 
 proc ifFlatFolder(s: string): string {.gcsafe.} = {.cast(gcsafe).}:
   withRLock(avatarIndexLock):
@@ -137,15 +128,6 @@ proc getPkFileExt(s: string): string =
     if query.key == "format":
       result = if query.value in allowedFormatExt: query.value else: result
 
-proc getHttpClient(): int =
-  withRLock(httpCounterLock):
-    if httpCounter >= httpClientsLen:
-      httpCounter = 0
-
-    inc httpCounter
-
-    return httpCounter - 1
-
 proc handleGroup(client: HttpClient, group: PkGroup) {.gcsafe.} =
   withRLock(usedUrlsLock):
     if group.icon != "":
@@ -172,7 +154,8 @@ proc handleGroup(client: HttpClient, group: PkGroup) {.gcsafe.} =
 
     groupCacheUrl = groupCacheUrl / "g".ifFlatFolder / (group.uuid & '.' & fileExt)
 
-    groupCacheUrl.scheme = ""
+    if removeScheme:
+      groupCacheUrl.scheme = ""
 
     {.cast(gcsafe).}:
       client.downloadFile(group.icon, joinPath(config.output_folder, 
@@ -239,7 +222,8 @@ proc handleMember(client: HttpClient, member: PkMember) {.gcsafe.} =
 
     memberCacheUrl = memberCacheUrl / "m".ifFlatFolder / (member.uuid & '.' & fileExt)
 
-    memberCacheUrl.scheme = ""
+    if removeScheme:
+      memberCacheUrl.scheme = ""
 
     withRLock(avatarIndexLock):
       {.cast(gcsafe).}:
@@ -285,9 +269,12 @@ proc generateNewSystemJson() =
 
   withRLock(avatarIndexLock):
     if avatarIndex.system.isSome:
-      sysjson["avatar_url"] = newJString(
-        $(urlBase / (avatarIndex.system.get().uuid & '.' & avatarIndex.system.get().ext))
-      )
+      var url = urlBase / (avatarIndex.system.get().uuid & '.' & avatarIndex.system.get().ext)
+
+      if removeScheme:
+        url.scheme = ""
+
+      sysjson["avatar_url"] = newJString($url)
 
     for uuid in avatarIndex.groups.keys:
       withRLock(validAvatarUUIDsLock):
@@ -299,8 +286,13 @@ proc generateNewSystemJson() =
           var counter = 0
 
           while counter < groupsLen:
-            if sysjson["groups"][counter]["uuid"].getStr() != uuid:
-              sysjson["groups"][counter]["icon"] = ("g".ifFlatFolder / uuid & '.' & group.ext).newJString()
+            if sysjson["groups"][counter]["uuid"].getStr() == uuid:
+              var url = urlBase / "g".ifFlatFolder / (uuid & '.' & group.ext)
+
+              if removeScheme:
+                url.scheme = ""
+
+              sysjson["groups"][counter]["icon"] = newJString($url)
 
             inc counter
 
@@ -314,8 +306,13 @@ proc generateNewSystemJson() =
           var counter = 0
 
           while counter < membersLen:
-            if sysjson["members"][counter]["uuid"].getStr() != uuid:
-              sysjson["members"][counter]["avatar_url"] = ("m".ifFlatFolder / uuid & '.' & member.ext).newJString()
+            if sysjson["members"][counter]["uuid"].getStr() == uuid:
+              var url = urlBase / "m".ifFlatFolder / (uuid & '.' & member.ext)
+
+              if removeScheme:
+                url.scheme = ""
+
+              sysjson["members"][counter]["avatar_url"] = newJString($url)
 
             inc counter
 
@@ -352,9 +349,12 @@ proc main =
 
           systemCacheUri.scheme = "http"
 
+        sysAvatarExt = system.avatar_url.getPkFileExt()
+
         systemCacheUri = systemCacheUri / (system.uuid & '.' & sysAvatarExt)
 
-        systemCacheUri.scheme = ""
+        if removeScheme:
+          systemCacheUri.scheme = ""
 
         try:
           echo "Downloading the system's avatar..."
@@ -362,9 +362,7 @@ proc main =
           withRLock(usedUrlsLock):
             usedUrls.add system.avatar_url
 
-          sysAvatarExt = system.avatar_url.getPkFileExt()
-
-          httpClients[getHttpClient()].downloadFile(system.avatar_url,
+          newHttpClient().downloadFile(system.avatar_url,
             joinPath(config.output_folder, system.uuid & '.' & sysAvatarExt))
 
           withRLock(avatarIndexLock):
@@ -397,20 +395,20 @@ proc main =
     var counter = 0
 
     for group in groups:
-      if counter >= httpClients.len:
+      if counter >= MaxThreadPoolSize:
         sync()
 
-      spawn handleGroup(httpClients[getHttpClient()], group)
+      spawn handleGroup(newHttpClient(), group)
 
       inc counter
 
     counter = 0
 
     for member in members:
-      if counter >= httpClients.len:
+      if counter >= MaxThreadPoolSize:
         sync()
 
-      spawn handleMember(httpClients[getHttpClient()], member)
+      spawn handleMember(newHttpClient(), member)
 
       inc counter
 
@@ -430,6 +428,8 @@ proc main =
                 avatarIndex.invalidUrls.del counter
 
               inc counter
+
+    sync()
 
     echo "Finished downloading all avatars!"
 
